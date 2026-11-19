@@ -136,8 +136,8 @@ router.post('/', (req, res) => {
         mimeType: file.mimetype,
         size: file.size,
       });
-      await trySend(doc); // failure is retained + retryable by admin
-      res.status(201).json({ message: 'Invoice submitted successfully' });
+       res.status(201).json({ message: 'Invoice submitted successfully' });
+trySend(doc).catch((e) => console.error('[supplier-invoice] background send failed:', e.message));
     } catch (err) {
       console.error('[supplier-invoice] save failed:', err);
       res.status(500).json({ message: 'Something went wrong. Please try again.' });
