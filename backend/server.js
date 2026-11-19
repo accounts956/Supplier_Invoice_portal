@@ -15,3 +15,11 @@ mongoose
   .connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/supplier_invoice')
   .then(() => app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`)))
   .catch((err) => { console.error('MongoDB connection failed:', err.message); process.exit(1); });
+.then(() => app.listen(PORT, () => {
+  console.log(`API running on http://localhost:${PORT}`);
+  if (process.env.RENDER_EXTERNAL_URL) {
+    setInterval(() => {
+      fetch(`${process.env.RENDER_EXTERNAL_URL}/api/health`).catch((e) => console.warn('keep-alive ping failed:', e.message));
+    }, 10 * 60 * 1000).unref();
+  }
+}))
