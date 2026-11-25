@@ -51,37 +51,14 @@ const hasValidSignature = (filePath) => {
 const EMAIL_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/;
 
 // ---------- mail ----------
-// Two delivery modes. HTTPS API (BREVO_API_KEY) works on Render's free tier, which blocks SMTP ports 25/465/587.
-const useApi = () => Boolean(String(process.env.BREVO_API_KEY || '').trim());
-const requiredEnv = () => useApi()
-  ? ['BREVO_API_KEY', 'INVOICE_MAIL_FROM', 'INVOICE_RECIPIENT_EMAIL']
+// Two delivery modes:
+//  1. Gmail API over HTTPS (OAuth 2.0) -- works on Render Free, which blocks SMTP ports 25/465/587.
+//  2. Plain SMTP (fallback, e.g. local development).
+const useGmail = () => Boolean(String(process.env.GOOGLE_REFRESH_TOKEN || '').trim());
+const requiredEnv = () => useGmail()
+  ? ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN', 'INVOICE_MAIL_FROM', 'INVOICE_RECIPIENT_EMAIL']
   : ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'INVOICE_RECIPIENT_EMAIL'];
 const missingEnv = () => requiredEnv().filter((k) => !String(process.env[k] || '').trim());
-
-// Send through Brevo's HTTPS API. Success only if Brevo returns 2xx with a messageId.
-const sendViaApi = async ({ from, recipients, replyTo, subject, text, filename, filePath, contentType }) => {
-  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({
-      sender: { email: from.replace(/^.*<|>.*$/g, '').trim() || from },
-      to: recipients.map((email) => ({ email })),
-      replyTo: { email: replyTo },
-      subject,
-      textContent: text,
-      attachment: [{ name: filename, content: fs.readFileSync(filePath).toString('base64') }],
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
-  const body = await res.json().catch(() => ({}));
-  console.log('[supplier-invoice] Brevo result:', res.status, JSON.stringify(body));
-  if (!res.ok || !body.messageId) {
-    const detail = `Brevo HTTP ${res.status}: ${body.message || JSON.stringify(body)}`;
-    if (res.status === 401 || res.status === 403) throw new MailError('Email service authentication failed. Please contact the accounts team.', 502, detail);
-    throw new MailError('The invoice could not be emailed. Please try again.', 502, detail);
-  }
-  return body.messageId;
-};
 
 // Error that carries a supplier-safe message + HTTP status. Raw SMTP details go to logs/DB only.
 class MailError extends Error {
@@ -124,6 +101,78 @@ const classifyMailError = (err) => {
   return new MailError('The invoice could not be emailed. Please try again.', 502, detail);
 };
 
+// ----- Gmail API (OAuth 2.0 refresh-token flow, HTTPS only) -----
+let gToken = { value: null, exp: 0 };
+const getGoogleAccessToken = async () => {
+  if (gToken.value && Date.now() < gToken.exp - 60000) return gToken.value;
+  let res, body;
+  try {
+    res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+        grant_type: 'refresh_token',
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch (err) {
+    throw new MailError('Could not reach the email service. Please try again shortly.', 503, `Google token endpoint unreachable: ${err.message}`);
+  }
+  if (!res.ok || !body.access_token) {
+    // invalid_grant = refresh token revoked/expired; invalid_client = wrong client id/secret
+    throw new MailError('Email service authentication failed. Please contact the accounts team.', 502,
+      `Google OAuth ${res.status}: ${body.error || ''} ${body.error_description || ''}`.trim());
+  }
+  gToken = { value: body.access_token, exp: Date.now() + (Number(body.expires_in) || 3600) * 1000 };
+  return gToken.value;
+};
+
+const sendViaGmail = async ({ from, recipients, replyTo, subject, text, filename, filePath, contentType }) => {
+  // Build the RFC 822 message (headers + multipart + attachment) with nodemailer's composer
+  const MailComposer = require('nodemailer/lib/mail-composer');
+  const raw = await new Promise((resolve, reject) =>
+    new MailComposer({
+      // Gmail always sends as the authenticated account, so show the supplier as the sender NAME
+      // (visible in the inbox list); Reply-To sends replies straight to the supplier.
+      from: { name: `${replyTo} (via Supplier Invoice Portal)`, address: (from.match(/<([^>]+)>/) || [null, from])[1].trim() },
+      to: recipients, replyTo, subject, text,
+      attachments: [{ filename, path: filePath, contentType }],
+    }).compile().build((err, msg) => (err ? reject(err) : resolve(msg))));
+  const encoded = raw.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  const accessToken = await getGoogleAccessToken();
+  let res, body;
+  try {
+    res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ raw: encoded }),
+      signal: AbortSignal.timeout(45000),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch (err) {
+    throw new MailError('Could not reach the email service. Please try again shortly.', 503, `Gmail API unreachable: ${err.message}`);
+  }
+  console.log('[supplier-invoice] Gmail API result:', res.status, JSON.stringify({ id: body.id, threadId: body.threadId, labelIds: body.labelIds }));
+  if (!res.ok || !body.id) {
+    const g = body.error || {};
+    const detail = `Gmail API ${res.status}: ${g.status || ''} ${g.message || JSON.stringify(body)}`.trim();
+    if (res.status === 401) gToken = { value: null, exp: 0 };
+    if (res.status === 401 || res.status === 403 && /insufficient|scope|disabled|not been used/i.test(g.message || ''))
+      throw new MailError('Email service authentication failed. Please contact the accounts team.', 502, detail);
+    if (res.status === 429 || (res.status === 403 && /rate|quota|limit/i.test(g.message || '')))
+      throw new MailError('The email service is temporarily over its sending limit. Please try again later.', 503, detail);
+    if (res.status === 400)
+      throw new MailError('The invoice could not be emailed (rejected by the email service).', 502, detail);
+    throw new MailError('The invoice could not be emailed. Please try again.', 502, detail);
+  }
+  return body.id; // Gmail message id: proof Gmail accepted and stored the message
+};
+
 const sendInvoiceMail = async (doc) => {
   const missing = missingEnv();
   if (missing.length)
@@ -155,9 +204,9 @@ Please find the invoice document attached.
 Regards,
 Supplier Invoice Portal`;
 
-  if (useApi()) {
+  if (useGmail()) {
     try {
-      return await sendViaApi({ from, recipients, replyTo: doc.supplierEmail, subject, text, filename: safeName, filePath, contentType: doc.mimeType });
+      return await sendViaGmail({ from, recipients, replyTo: doc.supplierEmail, subject, text, filename: safeName, filePath, contentType: doc.mimeType });
     } catch (err) {
       if (err instanceof MailError) throw err;
       throw new MailError('Could not reach the email service. Please try again shortly.', 503, `${err.name}: ${err.message}`);
@@ -273,11 +322,11 @@ router.post('/admin/:id/retry', protect, adminOnly, async (req, res) => {
 router.get('/admin/mail-check', protect, adminOnly, async (req, res) => {
   const missing = missingEnv();
   if (missing.length) return res.status(503).json({ ok: false, missingEnv: missing });
-  if (useApi()) {
+  if (useGmail()) {
     try {
-      const r = await fetch('https://api.brevo.com/v3/account', { headers: { 'api-key': process.env.BREVO_API_KEY }, signal: AbortSignal.timeout(15000) });
-      return res.status(r.ok ? 200 : 502).json({ ok: r.ok, mode: 'brevo-api', status: r.status });
-    } catch (err) { return res.status(502).json({ ok: false, mode: 'brevo-api', error: err.message }); }
+      await getGoogleAccessToken();
+      return res.json({ ok: true, mode: 'gmail-api', from: process.env.INVOICE_MAIL_FROM });
+    } catch (err) { return res.status(err.status || 502).json({ ok: false, mode: 'gmail-api', error: err.message }); }
   }
   try {
     await getTransporter().verify();
