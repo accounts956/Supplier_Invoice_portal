@@ -71,6 +71,34 @@ const sendInvoiceMail = async (doc) => {
   const filePath = path.join(UPLOAD_DIR, doc.storedName);
   if (!fs.existsSync(filePath)) throw new Error('Stored invoice file not found');
 
+  // ✅ NEW: send via Brevo HTTPS API when BREVO_API_KEY is set (SMTP is blocked on Render free tier)
+  if (process.env.BREVO_API_KEY) {
+    const to = String(process.env.INVOICE_RECIPIENT_EMAIL || '').trim();
+    if (!EMAIL_RE.test(to)) throw Object.assign(new Error('INVOICE_RECIPIENT_EMAIL missing/invalid'), { code: 'EENVELOPE' });
+    const name = path.basename(doc.originalName).replace(/[^\w.\- ]/g, '_');
+    let r;
+    try {
+      r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { email: process.env.INVOICE_MAIL_FROM, name: 'Supplier Invoice Portal' },
+          to: [{ email: to }],
+          subject: 'New Supplier Invoice Received',
+          textContent: `Dear Team,\n\nA new invoice document has been uploaded by a supplier.\n\nSupplier Email: ${doc.supplierEmail}\n\nPlease find the invoice document attached.\n\nRegards,\nSupplier Invoice Portal`,
+          attachment: [{ name, content: fs.readFileSync(filePath).toString('base64') }],
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch (e) {
+      throw Object.assign(new Error('Brevo unreachable: ' + e.message), { code: 'ECONNECTION' });
+    }
+    const body = await r.text();
+    console.log('[supplier-invoice] Brevo:', r.status, body);
+    if (!r.ok) throw Object.assign(new Error(`Brevo ${r.status}: ${body}`.slice(0, 400)), { code: r.status === 401 || r.status === 403 ? 'EAUTH' : r.status === 400 ? 'EENVELOPE' : 'EAPI' });
+    return JSON.parse(body).messageId;
+  }
+
   // ✅ NEW: fail loudly on missing config
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)
     throw Object.assign(new Error('SMTP env vars missing'), { code: 'ECONFIG' });
