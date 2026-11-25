@@ -11,7 +11,9 @@ const { protect, adminOnly } = require('../../shared/middleware/auth');
 const router = express.Router();
 
 // ---------- storage (outside any public/static dir) ----------
-const UPLOAD_DIR = path.join(__dirname, '..', '..', 'private_uploads', 'supplier-invoices');
+const UPLOAD_DIR = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR, 'supplier-invoices')
+  : path.join(__dirname, '..', '..', 'private_uploads', 'supplier-invoices');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const ALLOWED = {
@@ -59,9 +61,50 @@ const getTransporter = () => {
       port: Number(process.env.SMTP_PORT || 587),
       secure: process.env.SMTP_SECURE === 'true',
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 30000,
     });
   }
   return transporter;
+};
+
+// Parses "Name <email@x.com>" or a bare address
+const parseFrom = (v) => {
+  const m = String(v || '').match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/);
+  return m ? { name: m[1].trim() || 'Supplier Invoice Portal', email: m[2].trim() } : { name: 'Supplier Invoice Portal', email: String(v || '').trim() };
+};
+
+const MAIL_TEXT = (doc) =>
+`Dear Team,
+
+A new invoice document has been uploaded by a supplier.
+
+Supplier Email: ${doc.supplierEmail}
+
+Please find the invoice document attached.
+
+Regards,
+Supplier Invoice Portal`;
+
+// HTTPS email API (Brevo). Used when BREVO_API_KEY is set - needed on hosts that block outbound SMTP (e.g. Render free tier).
+const sendViaBrevo = async (doc, filePath, safeName) => {
+  const sender = parseFrom(process.env.INVOICE_MAIL_FROM || process.env.SMTP_USER);
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({
+      sender,
+      to: [{ email: process.env.INVOICE_RECIPIENT_EMAIL }],
+      subject: 'New Supplier Invoice Received',
+      textContent: MAIL_TEXT(doc),
+      attachment: [{ name: safeName, content: fs.readFileSync(filePath).toString('base64') }],
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Brevo ${res.status}: ${data.message || 'request failed'}`);
+  return data.messageId || 'brevo';
 };
 
 const sendInvoiceMail = async (doc) => {
@@ -69,6 +112,7 @@ const sendInvoiceMail = async (doc) => {
   if (!fs.existsSync(filePath)) throw new Error('Stored invoice file not found');
 
   const safeName = path.basename(doc.originalName).replace(/[^\w.\- ]/g, '_');
+  if (process.env.BREVO_API_KEY) return sendViaBrevo(doc, filePath, safeName);
   const info = await getTransporter().sendMail({
     from: process.env.INVOICE_MAIL_FROM || process.env.SMTP_USER, // system sender, NOT supplier
     to: process.env.INVOICE_RECIPIENT_EMAIL,                      // admin-configured recipient
@@ -136,8 +180,8 @@ router.post('/', (req, res) => {
         mimeType: file.mimetype,
         size: file.size,
       });
-       res.status(201).json({ message: 'Invoice submitted successfully' });
-trySend(doc).catch((e) => console.error('[supplier-invoice] background send failed:', e.message));
+      res.status(201).json({ message: 'Invoice submitted successfully' }); // reply immediately
+      trySend(doc).catch((e) => console.error('[supplier-invoice] background send failed:', e.message)); // email in background; admin can Retry
     } catch (err) {
       console.error('[supplier-invoice] save failed:', err);
       res.status(500).json({ message: 'Something went wrong. Please try again.' });
