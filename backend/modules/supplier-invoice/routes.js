@@ -3,8 +3,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { google } = require('googleapis');
-const MailComposer = require('nodemailer/lib/mail-composer'); // MIME builder only (no SMTP transport is created)
+const nodemailer = require('nodemailer');
 const SupplierInvoice = require('./SupplierInvoice.model');
 // ⚠️ point this at your existing admin auth guard
 const { protect, adminOnly } = require('../../shared/middleware/auth');
@@ -36,6 +35,21 @@ const upload = multer({
   },
 });
 
+// ✅ NEW: multi-file uploader (same rules, up to 10 files)
+const uploadMany = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (req, file, cb) =>
+      cb(null, crypto.randomBytes(16).toString('hex') + path.extname(file.originalname).toLowerCase()),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024, files: 10 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ALLOWED[ext] && ALLOWED[ext].includes(file.mimetype)) return cb(null, true);
+    cb(new Error('Only PDF, JPG, JPEG and PNG files are allowed'));
+  },
+});
+
 // verify real file signature, not just the extension
 const hasValidSignature = (filePath) => {
   const buf = Buffer.alloc(8);
@@ -52,83 +66,66 @@ const hasValidSignature = (filePath) => {
 const EMAIL_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/;
 
 // ---------- mail ----------
-// ---------- mail: Gmail API over HTTPS (OAuth 2.0), scope gmail.send only ----------
-// Works on Render Free, which blocks outbound SMTP (ports 25/465/587).
-const REQUIRED_ENV = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN', 'INVOICE_MAIL_FROM', 'INVOICE_RECIPIENT_EMAIL'];
-const missingEnv = () => REQUIRED_ENV.filter((k) => !String(process.env[k] || '').trim());
-
-// Error carrying a supplier-safe message + HTTP status. Raw Google details go to logs/DB only.
-class MailError extends Error {
-  constructor(publicMessage, status, detail) {
-    super(detail || publicMessage);
-    this.publicMessage = publicMessage;
-    this.status = status;
+let transporter;
+const getTransporter = () => {
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      connectionTimeout: 15000, // ✅ NEW
+      greetingTimeout: 15000,   // ✅ NEW
+      socketTimeout: 30000,     // ✅ NEW
+    });
   }
-}
-
-let oauthClient;
-const getOAuthClient = () => {
-  if (!oauthClient) {
-    oauthClient = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    oauthClient.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  }
-  return oauthClient;
-};
-const getGmail = () => google.gmail({ version: 'v1', auth: getOAuthClient() });
-
-// Translate a googleapis / network failure into a MailError
-const classifyMailError = (err) => {
-  if (err instanceof MailError) return err;
-  const data = (err.response && err.response.data) || {};
-  const status = Number((err.response && err.response.status) || (typeof err.code === 'number' ? err.code : 0)) || 0;
-  const reason = typeof data.error === 'string' ? data.error : (data.error && (data.error.status || data.error.message)) || '';
-  const detail = `${status || err.code || 'ERR'} ${reason} ${data.error_description || ''} ${err.message || ''}`.replace(/\s+/g, ' ').trim();
-  const msg = `${reason} ${err.message}`;
-
-  if (/invalid_grant|invalid_client|unauthorized_client/i.test(msg) || status === 401 ||
-      (status === 403 && /insufficient|scope|disabled|not been used|access.?not.?configured/i.test(msg)))
-    return new MailError('Email service authentication failed. Please contact the accounts team.', 502, detail);
-  if (status === 429 || (status === 403 && /rate|quota|limit/i.test(msg)))
-    return new MailError('The email service is temporarily over its sending limit. Please try again later.', 503, detail);
-  if (status === 400)
-    return new MailError('The invoice could not be emailed (rejected by the email service).', 502, detail);
-  if (!status && /ETIMEDOUT|ECONN|ENOTFOUND|EAI_AGAIN|ESOCKET|EHOSTUNREACH|socket hang up|network|timeout|fetch failed/i.test(`${err.code} ${err.message}`))
-    return new MailError('Could not reach the email service. Please try again shortly.', 503, detail);
-  return new MailError('The invoice could not be emailed. Please try again.', 502, detail);
+  return transporter;
 };
 
 const sendInvoiceMail = async (doc) => {
-  const missing = missingEnv();
-  if (missing.length)
-    throw new MailError('Email is not configured on the server. Please contact the accounts team.', 503,
-      `Missing env vars: ${missing.join(', ')}`);
-
   const filePath = path.join(UPLOAD_DIR, doc.storedName);
-  let stat;
-  try { stat = fs.statSync(filePath); } catch { stat = null; }
-  if (!stat || stat.size === 0)
-    throw new MailError('Your file could not be processed. Please upload it again.', 400, 'Stored invoice file missing or empty');
+  if (!fs.existsSync(filePath)) throw new Error('Stored invoice file not found');
 
-  const recipients = process.env.INVOICE_RECIPIENT_EMAIL.split(',').map((r) => r.trim()).filter(Boolean);
-  if (!recipients.length || !recipients.every((r) => EMAIL_RE.test(r)))
-    throw new MailError('Accounts email is misconfigured. Please contact the accounts team.', 503, 'INVOICE_RECIPIENT_EMAIL is not a valid address');
+  // ✅ NEW: send via Brevo HTTPS API when BREVO_API_KEY is set (SMTP is blocked on Render free tier)
+  if (process.env.BREVO_API_KEY) {
+    const to = String(process.env.INVOICE_RECIPIENT_EMAIL || '').trim();
+    if (!EMAIL_RE.test(to)) throw Object.assign(new Error('INVOICE_RECIPIENT_EMAIL missing/invalid'), { code: 'EENVELOPE' });
+    const name = path.basename(doc.originalName).replace(/[^\w.\- ]/g, '_');
+    let r;
+    try {
+      r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { email: process.env.INVOICE_MAIL_FROM, name: 'Supplier Invoice Portal' },
+          to: [{ email: to }],
+          subject: 'New Supplier Invoice Received',
+          textContent: `Dear Team,\n\nA new invoice document has been uploaded by a supplier.\n\nSupplier Email: ${doc.supplierEmail}\n\nPlease find the invoice document attached.\n\nRegards,\nSupplier Invoice Portal`,
+          attachment: [{ name, content: fs.readFileSync(filePath).toString('base64') }],
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch (e) {
+      throw Object.assign(new Error('Brevo unreachable: ' + e.message), { code: 'ECONNECTION' });
+    }
+    const body = await r.text();
+    console.log('[supplier-invoice] Brevo:', r.status, body);
+    if (!r.ok) throw Object.assign(new Error(`Brevo ${r.status}: ${body}`.slice(0, 400)), { code: r.status === 401 || r.status === 403 ? 'EAUTH' : r.status === 400 ? 'EENVELOPE' : 'EAPI' });
+    return JSON.parse(body).messageId;
+  }
 
-  const fromRaw = process.env.INVOICE_MAIL_FROM.trim();
-  const fromAddress = (fromRaw.match(/<([^>]+)>/) || [null, fromRaw])[1].trim();
+  // ✅ NEW: fail loudly on missing config
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)
+    throw Object.assign(new Error('SMTP env vars missing'), { code: 'ECONFIG' });
+  if (!EMAIL_RE.test(String(process.env.INVOICE_RECIPIENT_EMAIL || '').trim()))
+    throw Object.assign(new Error('INVOICE_RECIPIENT_EMAIL missing/invalid'), { code: 'EENVELOPE' });
+
   const safeName = path.basename(doc.originalName).replace(/[^\w.\- ]/g, '_');
-
-  // Build the RFC 822 message with the real file attached
-  let raw;
-  try {
-    raw = await new Promise((resolve, reject) =>
-      new MailComposer({
-        // Gmail always sends as the authenticated mailbox, so show the supplier as the sender NAME;
-        // Reply-To makes replies go straight to the supplier.
-        from: { name: `${doc.supplierEmail} (via Supplier Invoice Portal)`, address: fromAddress },
-        to: recipients,
-        replyTo: doc.supplierEmail,
-        subject: `New Supplier Invoice from ${doc.supplierEmail}`, // supplier email already validated (no newlines)
-        text:
+  const info = await getTransporter().sendMail({
+    from: process.env.INVOICE_MAIL_FROM || process.env.SMTP_USER, // system sender, NOT supplier
+    to: process.env.INVOICE_RECIPIENT_EMAIL,                      // admin-configured recipient
+    subject: 'New Supplier Invoice Received',
+    text:
 `Dear Team,
 
 A new invoice document has been uploaded by a supplier.
@@ -139,46 +136,127 @@ Please find the invoice document attached.
 
 Regards,
 Supplier Invoice Portal`,
-        attachments: [{ filename: safeName, path: filePath, contentType: doc.mimeType }],
-      }).compile().build((err, msg) => (err ? reject(err) : resolve(msg))));
-  } catch (err) {
-    throw new MailError('Your file could not be attached. Please upload it again.', 400, `Attachment build failed: ${err.message}`);
-  }
-  const encoded = raw.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    attachments: [{ filename: safeName, path: filePath, contentType: doc.mimeType }],
+  });
 
-  let result;
-  try {
-    result = await getGmail().users.messages.send({ userId: 'me', requestBody: { raw: encoded } }, { timeout: 45000 });
-  } catch (err) {
-    throw classifyMailError(err);
-  }
+  // ✅ NEW: confirm SMTP actually accepted the message
+  console.log('[supplier-invoice] SMTP:', info.response, '| accepted:', info.accepted, '| rejected:', info.rejected);
+  if (!info.accepted || !info.accepted.length || (info.rejected && info.rejected.length))
+    throw Object.assign(new Error('SMTP rejected the recipient'), { code: 'EENVELOPE' });
 
-  // Success only if Gmail accepted the message AND returned a message id.
-  const data = result && result.data;
-  if (!result || result.status < 200 || result.status >= 300 || !data || !data.id)
-    throw new MailError('The invoice could not be emailed. Please try again.', 502,
-      `Gmail did not confirm acceptance: status=${result && result.status}`);
-  console.log('[supplier-invoice] Gmail accepted:', JSON.stringify({ id: String(doc._id), gmailMessageId: data.id, labels: data.labelIds }));
-  return data.id;
+  return info.messageId;
 };
 
-// Returns { doc, error } — never throws; status is persisted either way.
 const trySend = async (doc) => {
   doc.attempts += 1;
-  let error = null;
   try {
     doc.messageId = await sendInvoiceMail(doc);
     doc.status = 'sent';
     doc.sentAt = new Date();
     doc.lastError = '';
   } catch (err) {
-    error = classifyMailError(err);
     doc.status = 'failed';
-    doc.lastError = String(error.message).slice(0, 500);
-    console.error('[supplier-invoice] email failed:', String(doc._id), error.message);
+    doc.lastError = String(err.message || err).slice(0, 500);
+    doc._errCode = err.code; // ✅ NEW (plain property, not saved to DB)
+    console.error('[supplier-invoice] email failed:', doc._id, doc.lastError);
+    console.error('[supplier-invoice] SMTP error code:', err.code, '| response:', err.response); // ✅ NEW
   }
   await doc.save();
-  return { doc, error };
+  return doc;
+};
+
+// ✅ NEW: ONE email with ALL files attached (used by the multi-file route)
+const sendBatchMail = async (docs) => {
+  const items = docs.map((d) => ({
+    doc: d,
+    filePath: path.join(UPLOAD_DIR, d.storedName),
+    name: path.basename(d.originalName).replace(/[^\w.\- ]/g, '_'),
+  }));
+  items.forEach((i) => {
+    if (!fs.existsSync(i.filePath)) throw new Error('Stored invoice file not found: ' + i.name);
+  });
+
+  const to = String(process.env.INVOICE_RECIPIENT_EMAIL || '').trim();
+  if (!EMAIL_RE.test(to)) throw Object.assign(new Error('INVOICE_RECIPIENT_EMAIL missing/invalid'), { code: 'EENVELOPE' });
+
+  const subject = `New Supplier Invoices Received (${items.length})`;
+  const text =
+`Dear Team,
+
+${items.length} invoice documents have been uploaded by a supplier.
+
+Supplier Email: ${docs[0].supplierEmail}
+
+Files:
+${items.map((i, n) => `${n + 1}. ${i.name}`).join('\n')}
+
+Please find the invoice documents attached.
+
+Regards,
+Supplier Invoice Portal`;
+
+  // Brevo HTTPS API (works on Render free tier)
+  if (process.env.BREVO_API_KEY) {
+    let r;
+    try {
+      r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { email: process.env.INVOICE_MAIL_FROM, name: 'Supplier Invoice Portal' },
+          to: [{ email: to }],
+          subject,
+          textContent: text,
+          attachment: items.map((i) => ({ name: i.name, content: fs.readFileSync(i.filePath).toString('base64') })),
+        }),
+        signal: AbortSignal.timeout(60000),
+      });
+    } catch (e) {
+      throw Object.assign(new Error('Brevo unreachable: ' + e.message), { code: 'ECONNECTION' });
+    }
+    const body = await r.text();
+    console.log('[supplier-invoice] Brevo (batch):', r.status, body);
+    if (!r.ok) throw Object.assign(new Error(`Brevo ${r.status}: ${body}`.slice(0, 400)), { code: r.status === 401 || r.status === 403 ? 'EAUTH' : r.status === 400 ? 'EENVELOPE' : 'EAPI' });
+    return JSON.parse(body).messageId;
+  }
+
+  // SMTP fallback
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)
+    throw Object.assign(new Error('SMTP env vars missing'), { code: 'ECONFIG' });
+  const info = await getTransporter().sendMail({
+    from: process.env.INVOICE_MAIL_FROM || process.env.SMTP_USER,
+    to,
+    subject,
+    text,
+    attachments: items.map((i) => ({ filename: i.name, path: i.filePath, contentType: i.doc.mimeType })),
+  });
+  console.log('[supplier-invoice] SMTP (batch):', info.response, '| accepted:', info.accepted, '| rejected:', info.rejected);
+  if (!info.accepted || !info.accepted.length || (info.rejected && info.rejected.length))
+    throw Object.assign(new Error('SMTP rejected the recipient'), { code: 'EENVELOPE' });
+  return info.messageId;
+};
+
+// ✅ NEW: sends one batch email and marks every record in it sent / failed together
+const trySendBatch = async (docs) => {
+  docs.forEach((d) => { d.attempts += 1; });
+  let result = { ok: false, code: undefined };
+  try {
+    const messageId = await sendBatchMail(docs);
+    docs.forEach((d) => {
+      d.messageId = messageId;
+      d.status = 'sent';
+      d.sentAt = new Date();
+      d.lastError = '';
+    });
+    result = { ok: true };
+  } catch (err) {
+    const msg = String(err.message || err).slice(0, 500);
+    docs.forEach((d) => { d.status = 'failed'; d.lastError = msg; });
+    console.error('[supplier-invoice] batch email failed:', msg, '| code:', err.code, '| response:', err.response);
+    result = { ok: false, code: err.code };
+  }
+  await Promise.all(docs.map((d) => d.save()));
+  return result;
 };
 
 // ---------- PUBLIC: supplier submit ----------
@@ -212,12 +290,81 @@ router.post('/', (req, res) => {
         mimeType: file.mimetype,
         size: file.size,
       });
-      // Wait for Gmail's confirmation before telling the supplier anything.
-      const { error } = await trySend(doc);
-      if (error) return res.status(error.status).json({ message: error.publicMessage });
-      return res.status(201).json({ message: 'Invoice submitted successfully' });
+
+      // ✅ NEW: wait for the SMTP result before replying (replaces the early 201 + background send)
+      const sent = await trySend(doc);
+      if (sent.status !== 'sent') {
+        const c = sent._errCode;
+        const msg =
+          c === 'EAUTH' ? 'Email service login failed. Please contact the accounts team.' :
+          c === 'EENVELOPE' ? 'The accounts email address was rejected. Please contact the accounts team.' :
+          ['ETIMEDOUT', 'ECONNECTION', 'ESOCKET', 'EDNS'].includes(c) ? 'Could not reach the email server. Please try again later.' :
+          'Invoice could not be emailed. Please try again later.';
+        return res.status(502).json({ message: msg });
+      }
+      res.status(201).json({ message: 'Invoice sent' });
     } catch (err) {
       console.error('[supplier-invoice] save failed:', err);
+      res.status(500).json({ message: 'Something went wrong. Please try again.' });
+    }
+  });
+});
+
+// ✅ NEW: PUBLIC multi-file submit
+router.post('/multiple', (req, res) => {
+  uploadMany.array('invoices', 10)(req, res, async (uploadErr) => {
+    const files = req.files || [];
+    const discardAll = () => files.forEach((f) => fs.unlink(f.path, () => {}));
+
+    if (uploadErr) {
+      discardAll();
+      return res.status(400).json({
+        message:
+          uploadErr.code === 'LIMIT_FILE_SIZE' ? 'A file is too large (max 10 MB each)' :
+          uploadErr.code === 'LIMIT_UNEXPECTED_FILE' ? 'You can upload up to 10 files at once' :
+          uploadErr.message,
+      });
+    }
+
+    const email = String(req.body.supplierEmail || '').trim().toLowerCase();
+    if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
+      discardAll();
+      return res.status(400).json({ message: 'Please enter a valid email address' });
+    }
+    if (!files.length) return res.status(400).json({ message: 'Please upload at least one invoice document' });
+    if (files.some((f) => !hasValidSignature(f.path))) {
+      discardAll();
+      return res.status(400).json({ message: 'One or more files are invalid or corrupted' });
+    }
+    // ✅ NEW: combined size cap (provider limit is ~20 MB per email, base64 adds ~33%)
+    if (files.reduce((sum, f) => sum + f.size, 0) > 15 * 1024 * 1024) {
+      discardAll();
+      return res.status(400).json({ message: 'Total size of all files must be 15 MB or less. Send fewer files at once.' });
+    }
+
+    const mailErrMsg = (c) =>
+      c === 'EAUTH' ? 'Email service login failed. Please contact the accounts team.' :
+      c === 'EENVELOPE' ? 'The accounts email address was rejected. Please contact the accounts team.' :
+      ['ETIMEDOUT', 'ECONNECTION', 'ESOCKET', 'EDNS'].includes(c) ? 'Could not reach the email server. Please try again later.' :
+      'Invoices could not be emailed. Please try again later.';
+
+    try {
+      // ✅ CHANGED: one record per file, but ONE email with all attachments
+      const docs = [];
+      for (const file of files) {
+        docs.push(await SupplierInvoice.create({
+          supplierEmail: email,
+          originalName: file.originalname,
+          storedName: file.filename,
+          mimeType: file.mimetype,
+          size: file.size,
+        }));
+      }
+      const sent = await trySendBatch(docs);
+      if (!sent.ok) return res.status(502).json({ message: mailErrMsg(sent.code) });
+      res.status(201).json({ message: 'Invoices sent', sent: docs.length });
+    } catch (err) {
+      console.error('[supplier-invoice] multi save failed:', err);
       res.status(500).json({ message: 'Something went wrong. Please try again.' });
     }
   });
@@ -235,18 +382,6 @@ router.post('/admin/:id/retry', protect, adminOnly, async (req, res) => {
   if (doc.status === 'sent') return res.status(409).json({ message: 'Already sent' });
   await trySend(doc);
   res.json({ status: doc.status, lastError: doc.lastError });
-});
-
-// ADMIN: verify the Gmail OAuth credentials from the deployed server (never exposes secrets)
-router.get('/admin/mail-check', protect, adminOnly, async (req, res) => {
-  const missing = missingEnv();
-  if (missing.length) return res.status(503).json({ ok: false, missingEnv: missing });
-  try {
-    await getOAuthClient().getAccessToken();
-    res.json({ ok: true, mode: 'gmail-api', from: process.env.INVOICE_MAIL_FROM });
-  } catch (err) {
-    res.status(502).json({ ok: false, mode: 'gmail-api', error: classifyMailError(err).message });
-  }
 });
 
 module.exports = router;
